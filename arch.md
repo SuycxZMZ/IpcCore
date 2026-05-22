@@ -15,6 +15,8 @@ A2. IpcCore 内部只解决本机进程间连接、Session、消息收发、发�
 
 A3. 架构设计必须遵守 `req.md` 中“代码实现硬性规范”，包括中文注释、命名规范、格式规范、错误码约束、fd 所有权、线程退出路径和 Stop 可重复调用。
 
+A3-1. IpcCore 第一版按照 C++17 设计，避免使用 C++20 及更高版本特性，保证后续在 Android NDK 与 Linux 调试环境中的可编译性和可维护性。
+
 A4. 第一版实现应保持小而清晰，核心代码目标控制在 5000 行以内。
 
 ---
@@ -52,6 +54,8 @@ A9. Send 是快速入队接口，不在调用线程执行长时间 socket send�
 A10. 每个 Session 拥有独立发送队列和接收缓存，慢客户端只影响自身 Session。
 
 A11. 事件循环线程不得执行长时间阻塞逻辑。
+
+A11-1. 内部长生命周期线程统一由 `std::thread` 创建，不直接使用 `pthread_create`。
 
 A12. 调用上层回调前必须释放内部锁。
 
@@ -237,6 +241,24 @@ RunLoop
   -> periodic check: heartbeat timeout / send stall
 ```
 
+### 6.1 epoll 底层事件数据结构设计
+
+A42-1. epoll 相关事件可以使用轻量 POD 结构承载，例如保存 fd、事件类型、session_id 和非拥有 user_data 指针。
+
+A42-2. 使用 POD 的目的是减少封装层级，保持 IpcCore 第一版精简，不引入复杂 Reactor 框架。
+
+A42-3. 资源管理不能下沉到 POD，POD 只描述事件，不负责创建、关闭或转移 fd 所有权。
+
+A42-4. fd 的所有权必须由 `IpcSession`、`IpcServer`、`IpcClient` 或专门的 RAII 小对象管理。
+
+A42-5. `epoll_event.data.ptr` 如果保存指针，必须保证指针生命周期长于 epoll 监听周期。
+
+A42-6. Session 关闭时，必须先从 epoll 中删除 fd，再释放 Session 对象。
+
+A42-7. 不能让 epoll 事件中保存的指针指向已经释放的对象。
+
+A42-8. 如使用 `void* user_data`，必须在结构体中文注释中说明真实类型、生命周期和安全约束。
+
 ---
 
 ## 7. 发送队列设计
@@ -260,7 +282,7 @@ sequenceDiagram
     participant App as 上层调用方
     participant Session as IpcSession
     participant Queue as 发送队列
-    participant Loop as IpcEventLoop
+    participant EventLoop as IpcEventLoop
     participant Socket as AF_UNIX socket
 
     App->>Session: Send(type, payload)
@@ -269,9 +291,9 @@ sequenceDiagram
     alt 队列已满
         Session-->>App: IpcError::kQueueFull
     else 入队成功
-        Session->>Loop: 增加 EPOLLOUT / 唤醒
+        Session->>EventLoop: 增加 EPOLLOUT / 唤醒
         Session-->>App: IpcError::kOk
-        Loop->>Session: fd writable
+        EventLoop->>Session: fd writable
         Session->>Socket: send header + payload
         Session->>Queue: 发送完成后弹出队首
     end
@@ -383,6 +405,79 @@ A72. Stop 顺序建议为：设置 stopping 状态、唤醒 event loop、阻止�
 A73. Stop 后不得触发新的消息回调；已经进入执行中的回调不强制中断，但 Stop 不应永久等待上层长时间阻塞回调。
 
 A74. 析构函数不抛异常，如果对象尚未 Stop，应尽最大努力调用 Stop。
+
+### 12.1 资源所有权设计
+
+A74-1. `IpcServer` 拥有监听 fd 和服务端事件循环线程。
+
+A74-2. `IpcClient` 拥有客户端 socket fd 和客户端事件循环线程。
+
+A74-3. `IpcSession` 拥有连接 fd、发送队列、接收缓存和 Session 状态。
+
+A74-4. `IpcServer` 可以通过 `std::unordered_map<uint64_t, std::shared_ptr<IpcSession>>` 管理多个 Session。
+
+A74-5. epoll 事件处理中如需要访问 Session，应避免直接长期保存裸指针。
+
+A74-6. 可以通过 session_id 查询 `std::shared_ptr<IpcSession>`，或者使用明确生命周期受控的指针策略。
+
+A74-7. 如使用 `std::weak_ptr`，事件处理前必须 `lock()`，失败则说明 Session 已释放，应忽略该事件。
+
+A74-8. Session 关闭流程必须避免重复 close fd。
+
+A74-9. fd 建议统一使用小型 RAII 封装，或者至少保证每个 fd 只有一个明确关闭点。
+
+A74-10. Stop、Close、析构路径中必须断开回调、关闭 fd、清理队列、释放 Session 引用，避免 `std::shared_ptr` 循环引用导致对象无法释放。
+
+### 12.2 线程模型设计
+
+A74-11. Server 第一版使用一个 I/O event loop 线程处理 listen fd 和全部 session fd。
+
+A74-12. Client 第一版使用一个 I/O event loop 线程处理连接 fd、重连定时和 Stop 唤醒。
+
+A74-13. 第一版不设计复杂线程池，后续如果回调较重，可扩展独立 callback dispatch 线程。
+
+A74-14. 所有长生命周期线程必须由 Stop 通知退出并 join，不允许 detach。
+
+### 12.3 线程命名设计
+
+A74-15. IpcCore 内部线程由 `std::thread` 创建。
+
+A74-16. 在线程入口开始处调用 pthread 接口设置线程名。
+
+A74-17. Linux 调试阶段使用 `pthread_setname_np(pthread_self(), "ipc_server_io")`。
+
+A74-18. Android 后续也可以沿用 pthread 线程命名方式，但 Android 仍不进入第一版范围。
+
+A74-19. 线程名不能过长，需要考虑 Linux 线程名长度限制。
+
+A74-20. 线程命名失败不应影响主流程，但应打印 warning 日志。
+
+A74-21. 所有 IpcCore 内部长生命周期线程必须命名。
+
+A74-22. 建议线程名包括 `ipc_server_io`、`ipc_client_io`、`ipc_callback`；多个实例可使用 `ipc_srv_io_1`、`ipc_cli_io_1` 等短 id。
+
+说明性代码片段如下，仅用于文档说明，不生成真实源码文件：
+
+```cpp
+/**
+ * @brief 设置当前线程名称，便于 Linux / Android 调试工具识别线程职责。
+ *
+ * 该函数仅用于调试和问题定位，设置失败不影响主流程。
+ */
+void SetCurrentThreadName(const char* thread_name)
+{
+    if (thread_name == nullptr)
+    {
+        return;
+    }
+
+    int ret = pthread_setname_np(pthread_self(), thread_name);
+    if (ret != 0)
+    {
+        IPC_LOGW("set thread name failed, name=%s, ret=%d", thread_name, ret);
+    }
+}
+```
 
 Stop 退出流程：
 

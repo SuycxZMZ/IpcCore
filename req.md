@@ -359,7 +359,7 @@ R145. 上层回调不得长时间阻塞。
 
 ### 6.4 可维护性
 
-R146. 第一版优先使用 C++17 或 C++20 标准库能力，不引入大型第三方库。
+R146. 第一版最高支持 C++17，不允许使用 C++20 或更高版本特性，不引入大型第三方库。
 
 R147. 对外接口不允许只返回 bool，应返回 IpcResult 或 IpcError。
 
@@ -502,7 +502,27 @@ R187. 避免使用下划线开头和结尾，成员变量后缀下划线除外�
 
 R188. 第一版核心代码控制在 5000 行以内，不包含 demo 和测试代码。
 
-R189. 第一版优先使用 C++17 或 C++20 标准库能力，不引入大型第三方库。
+R189. IpcCore 第一版最高支持 C++17。
+
+R189-1. 不允许使用 C++20 或更高版本特性。
+
+R189-2. 不允许使用协程。
+
+R189-3. 不允许使用 concepts。
+
+R189-4. 不允许使用 C++20 ranges。
+
+R189-5. 不允许使用 `std::jthread`。
+
+R189-6. IpcCore 内部线程统一使用 `std::thread`。
+
+R189-7. 同步原语优先使用 C++17 标准库能力，例如 `std::mutex`、`std::condition_variable`、`std::atomic`、`std::lock_guard` 和 `std::unique_lock`。
+
+R189-8. `std::recursive_mutex` 仅在确有必要时使用，使用位置必须有中文注释说明原因。
+
+R189-9. 第一版不引入 Boost、ASIO、libevent、libuv 等大型第三方库。
+
+R189-10. 第一版只依赖 Linux 系统调用和 C++17 标准库。
 
 R190. 发送队列使用 `std::mutex + std::deque` 即可，不使用无锁队列。
 
@@ -533,6 +553,82 @@ R202. Stop 后不得再触发新的消息回调。
 R203. 高频日志必须限频。
 
 R204. 正常每条消息收发不允许默认打印 info 日志。
+
+### 8.5 Linux 底层 epoll 数据结构约束
+
+R204-1. 涉及 Linux 底层 epoll、socket fd、event fd、timer fd、唤醒 fd 等底层事件信息时，可以使用简单 C 风格 POD 数据结构。
+
+R204-2. POD 数据结构仅用于底层事件循环内部，不向上层业务暴露。
+
+R204-3. POD 数据结构字段必须语义明确，不能使用含糊命名。
+
+R204-4. POD 结构体成员按照项目规范使用小写 + 下划线，例如 `int fd`、`uint32_t events`、`uint64_t session_id`、`void* user_data`。
+
+R204-5. POD 结构体必须有中文注释，说明用途和字段含义。
+
+R204-6. POD 数据结构不得持有复杂资源所有权。
+
+R204-7. fd 的生命周期不得由裸 POD 结构体隐式管理。
+
+R204-8. fd 的创建、关闭、所有权转移必须由明确的 C++ 类或函数负责。
+
+R204-9. epoll 回调或事件分发中不得长期保存悬空指针。
+
+R204-10. 如使用 `void* user_data`，必须在注释中说明其真实类型、生命周期和安全约束。
+
+### 8.6 资源管理与现代 C++ 约束
+
+R204-11. IpcCore 虽然底层使用 Linux C API，但资源管理必须使用现代 C++ 思路。
+
+R204-12. fd、线程、Session、发送队列、接收缓存都必须有明确所有权。
+
+R204-13. 对于跨线程共享的 Session 对象，可以使用 `std::shared_ptr` 管理生命周期。
+
+R204-14. 对于避免循环引用或事件回调中弱引用 Session 的场景，可以使用 `std::weak_ptr`。
+
+R204-15. 不允许通过裸指针长期持有跨线程对象所有权。
+
+R204-16. 裸指针只能作为非拥有引用使用。
+
+R204-17. 如果使用裸指针，必须通过注释说明该指针不拥有资源。
+
+R204-18. 不允许在多个对象之间形成无法释放的 `std::shared_ptr` 循环引用。
+
+R204-19. 回调中捕获对象时，应优先考虑 `std::weak_ptr`，避免对象已销毁后继续访问。
+
+R204-20. Stop、Close、析构路径中必须断开回调、关闭 fd、清理队列、释放 Session 引用。
+
+### 8.7 线程创建与线程命名要求
+
+R204-21. IpcCore 内部线程统一使用 `std::thread` 创建。
+
+R204-22. 不使用 `pthread_create` 直接创建线程。
+
+R204-23. 线程启动后，需要使用 pthread 接口设置线程名。
+
+R204-24. Linux 下使用 `pthread_setname_np`。
+
+R204-25. 线程命名用于车机问题定位、top、perf、gdb、logcat 等工具追踪。
+
+R204-26. 每个长期运行线程必须有明确线程名。
+
+R204-27. 线程名应简短、稳定、可读。
+
+R204-28. 线程名长度需要考虑 Linux 线程名长度限制。
+
+R204-29. 线程退出必须可控。
+
+R204-30. Stop 时必须通知线程退出并 join。
+
+R204-31. 不允许 detach 长期线程。
+
+R204-32. 线程函数必须捕获异常，避免异常逃逸导致进程直接 terminate。
+
+R204-33. 线程入口必须有中文注释说明线程职责。
+
+R204-34. 建议线程名包括 `ipc_server_io`、`ipc_client_io`、`ipc_callback`。
+
+R204-35. 如果后续存在多个实例，可以追加短 id，例如 `ipc_srv_io_1`、`ipc_cli_io_1`。
 
 ---
 
@@ -606,30 +702,28 @@ R233. 持续运行 24 小时无内存持续增长。
 
 ## 10. 待确认项
 
-TODO-1. 第一版最终使用 C++17 还是 C++20。
+TODO-1. 是否允许使用 `std::function` 作为回调。
 
-TODO-2. 是否允许使用 `std::function` 作为回调。
+TODO-2. 是否需要完全避免动态内存分配。
 
-TODO-3. 是否需要完全避免动态内存分配。
+TODO-3. 默认 socket path 命名规则。
 
-TODO-4. 默认 socket path 命名规则。
+TODO-4. 默认 max_pending_message_count。
 
-TODO-5. 默认 max_pending_message_count。
+TODO-5. 默认 max_pending_bytes。
 
-TODO-6. 默认 max_pending_bytes。
+TODO-6. 默认 heartbeat_interval_ms。
 
-TODO-7. 默认 heartbeat_interval_ms。
+TODO-7. 默认 heartbeat_timeout_ms。
 
-TODO-8. 默认 heartbeat_timeout_ms。
+TODO-8. 默认 send_stall_timeout_ms。
 
-TODO-9. 默认 send_stall_timeout_ms。
+TODO-9. 第一版是否需要 CMake demo 工程。
 
-TODO-10. 第一版是否需要 CMake demo 工程。
+TODO-10. 第一版是否需要同时提供 server demo 和 client demo。
 
-TODO-11. 第一版是否需要同时提供 server demo 和 client demo。
+TODO-11. 第一版是否需要提供单元测试，还是先用 demo 压测验证。
 
-TODO-12. 第一版是否需要提供单元测试，还是先用 demo 压测验证。
+TODO-12. 是否需要为 Stop 设置默认最大等待时间。
 
-TODO-13. 是否需要为 Stop 设置默认最大等待时间。
-
-TODO-14. 是否需要为每个 Session 设置最大接收缓存上限。
+TODO-13. 是否需要为每个 Session 设置最大接收缓存上限。
